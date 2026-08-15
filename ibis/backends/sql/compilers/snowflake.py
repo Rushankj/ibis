@@ -14,6 +14,7 @@ import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 from ibis import util
+from ibis.util import gen_name
 from ibis.backends.sql.compilers._compat import EXCEPT_ARG
 from ibis.backends.sql.compilers.base import (
     NULL,
@@ -939,6 +940,149 @@ $$""",
 
     def visit_ArrayMean(self, op, *, arg):
         return self.cast(self.f.udf.array_avg(arg), op.dtype)
+
+    def visit_GapFill(self, op, *, parent, time_col, bucket_width, groups, metrics, origin):
+        """Compile GapFill for Snowflake.
+
+        If groups are present, we build a cross-joined spine of all buckets
+        and all distinct group combinations, ensuring each group has a dense series.
+        """
+        from ibis.expr.rewrites import rewrite_gapfill_input
+
+        rewrite_gapfill_input(op)
+
+        quoted = self.quoted
+
+        # Determine the interval unit string for DATEDIFF / DATEADD
+        interval_unit = op.bucket_width.dtype.resolution  # e.g. 'h', 'm', 's', 'D'
+        # Snowflake DATEADD unit names
+        _unit_map = {
+            "ns": "nanosecond",
+            "us": "microsecond",
+            "ms": "millisecond",
+            "s": "second",
+            "m": "minute",
+            "h": "hour",
+            "D": "day",
+            "M": "month",
+            "Y": "year",
+        }
+        sf_unit = _unit_map.get(interval_unit, "second")
+        unit_lit = sge.Var(this=sf_unit)
+
+        # ── 1. bounds subquery ───────────────────────────────────────────────
+        bounds_alias = sg.to_identifier(gen_name("gf_bounds"), quoted=quoted)
+        bounds_sub = (
+            sg.select(
+                self.f.min(time_col).as_("lo", quoted=quoted),
+                self.f.max(time_col).as_("hi", quoted=quoted),
+            )
+            .from_(parent)
+            .subquery(bounds_alias)
+        )
+
+        # ── 2. series subquery via GENERATOR ─────────────────────────────────
+        series_alias = sg.to_identifier(gen_name("gf_series"), quoted=quoted)
+        lo_ref = sg.column("lo", table=bounds_alias, quoted=quoted)
+        hi_ref = sg.column("hi", table=bounds_alias, quoted=quoted)
+
+        n_buckets = sge.Add(
+            this=self.f.datediff(unit_lit, lo_ref, hi_ref),
+            expression=sge.Literal.number(1),
+        )
+
+        bucket_ts = self.f.dateadd(
+            unit_lit,
+            sge.Column(this=sge.Var(this="SEQ8()")),
+            lo_ref,
+        )
+
+        generator_table = sge.Anonymous(
+            this="GENERATOR",
+            expressions=[sge.Kwarg(this=sge.Var(this="ROWCOUNT"), expression=n_buckets)],
+        )
+
+        series_sub = (
+            sg.select(bucket_ts.as_("bucket", quoted=quoted))
+            .from_(bounds_sub)
+            .join(
+                sge.Table(this=generator_table),
+                join_type="CROSS",
+            )
+            .subquery(series_alias)
+        )
+
+        # ── 3. Build spine (CROSS JOIN groups if any) ───────────────────────
+        if groups:
+            groups_alias = sg.to_identifier(gen_name("gf_groups"), quoted=quoted)
+            groups_cte = (
+                sg.select(*self._cleanup_names(groups))
+                .distinct()
+                .from_(parent)
+                .subquery(groups_alias)
+            )
+
+            spine_alias = sg.to_identifier(gen_name("gf_spine"), quoted=quoted)
+            spine_select = [
+                sg.column("bucket", table=series_alias, quoted=quoted),
+                *[sg.column(name, table=groups_alias, quoted=quoted) for name in groups]
+            ]
+            spine_sub = (
+                sg.select(*spine_select)
+                .from_(series_sub)
+                .join(groups_cte, join_type="CROSS")
+                .subquery(spine_alias)
+            )
+
+            from_target = spine_sub
+            from_alias = spine_alias
+        else:
+            from_target = series_sub
+            from_alias = series_alias
+
+        # ── 4. aggregation subquery ──────────────────────────────────────────
+        agg_alias = sg.to_identifier(gen_name("gf_agg"), quoted=quoted)
+        bucket_expr = self.f.time_slice(time_col, sge.Literal.number(1), unit_lit)
+        if origin is not None:
+            bucket_expr = self.f.time_slice(time_col, sge.Literal.number(1), unit_lit)
+
+        agg_select = [
+            bucket_expr.as_("bucket", quoted=quoted),
+            *self._cleanup_names(groups),
+            *self._cleanup_names(metrics)
+        ]
+        agg_group_by = [sge.Column(this=sge.Literal.number(1))]
+        agg_group_by += [sg.column(name, quoted=quoted) for name in groups]
+
+        agg_sub = (
+            sg.select(*agg_select)
+            .from_(parent)
+            .group_by(*agg_group_by)
+            .subquery(agg_alias)
+        )
+
+        # ── 5. final LEFT JOIN ───────────────────────────────────────────────
+        join_cond = sg.column("bucket", table=from_alias, quoted=quoted).eq(
+            sg.column("bucket", table=agg_alias, quoted=quoted)
+        )
+        if groups:
+            for name in groups:
+                cond = sg.column(name, table=from_alias, quoted=quoted).eq(
+                    sg.column(name, table=agg_alias, quoted=quoted)
+                )
+                join_cond = sge.And(this=join_cond, expression=cond)
+
+        final_select = [
+            sg.column("bucket", table=from_alias, quoted=quoted),
+            *[sg.column(name, table=from_alias, quoted=quoted) for name in groups],
+            *[sg.column(name, table=agg_alias, quoted=quoted) for name in metrics],
+        ]
+
+        return (
+            sg.select(*final_select)
+            .from_(from_target)
+            .join(agg_sub, on=join_cond, join_type="LEFT")
+        )
 
 
 compiler = SnowflakeCompiler()

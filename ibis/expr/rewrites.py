@@ -406,3 +406,67 @@ def simplify(node):
     node = node.replace(subsequent_projects | subsequent_filters)
     node = node.replace(complete_reprojection)
     return node
+
+
+# ── GapFill normalization ─────────────────────────────────────────────────
+
+
+def rewrite_gapfill_input(node: ops.GapFill) -> ops.GapFill:
+    """Validate and normalise a :class:`~ibis.expr.operations.GapFill` node.
+
+    This function is called by backend compilers before they translate a
+    ``GapFill`` node into dialect-specific SQL or DataFrame expressions.
+    It enforces two invariants that must hold for any correct gap-fill:
+
+    1. **Metrics must be reductions** — raw column references (``Field``)
+       are not meaningful for the synthetic, gap-filled rows that have no
+       matching source data.  Silently passing them through would produce
+       incorrect ``NULL`` values that look valid but are semantically wrong.
+
+    2. **groups and metrics must not overlap** — a column cannot
+       simultaneously be a partition key and an aggregated metric.
+
+    Parameters
+    ----------
+    node
+        The ``GapFill`` operation node to validate.
+
+    Returns
+    -------
+    ops.GapFill
+        The same node unchanged if all invariants hold.
+
+    Raises
+    ------
+    IbisInputError
+        If any metric is not an :class:`~ibis.expr.operations.Reduction`
+        or if a group key appears in the metrics dict.
+
+    Examples
+    --------
+    >>> import ibis, datetime
+    >>> t = ibis.memtable({"ts": [datetime.datetime(2024,1,1)], "val": [1]})
+    >>> node = t.ts.gapfill(ibis.interval(hours=1), metrics=[t.val.sum()]).op()
+    >>> from ibis.expr.rewrites import rewrite_gapfill_input
+    >>> rewrite_gapfill_input(node)  # passes without error
+    """
+    # Invariant 1: every metric must be a Reduction
+    for name, metric in node.metrics.items():
+        if not isinstance(metric, ops.Reduction):
+            raise IbisInputError(
+                f"GapFill metric {name!r} must be a reduction expression "
+                f"(e.g. .sum(), .mean(), .count()). "
+                f"Got {type(metric).__name__!r}. "
+                f"Hint: pass t.{name}.sum() instead of t.{name}."
+            )
+
+    # Invariant 2: no column should appear as both a group key and a metric
+    overlap = set(node.groups) & set(node.metrics)
+    if overlap:
+        raise IbisInputError(
+            f"GapFill columns {sorted(overlap)!r} appear in both "
+            f"'groups' and 'metrics'. A column can only be one of them."
+        )
+
+    return node
+

@@ -966,5 +966,115 @@ $$""".format(
     def visit_StringToTime(self, op, *, arg, format_str):
         return self.cast(self.f.str_to_time(arg, format_str), to=dt.time)
 
+    def visit_GapFill(self, op, *, parent, time_col, bucket_width, groups, metrics, origin):
+        """Compile GapFill for PostgreSQL using generate_series + LEFT JOIN.
+
+        If groups are present, we build a cross-joined spine of all buckets
+        and all distinct group combinations, ensuring each group has a dense series.
+        """
+        from ibis.expr.rewrites import rewrite_gapfill_input
+
+        rewrite_gapfill_input(op)
+
+        quoted = self.quoted
+
+        # ── 1. bounds subquery ───────────────────────────────────────────────
+        bounds_alias = sg.to_identifier(gen_name("gf_bounds"), quoted=quoted)
+        bounds_sub = (
+            sg.select(
+                self.f.min(time_col).as_("lo", quoted=quoted),
+                self.f.max(time_col).as_("hi", quoted=quoted),
+            )
+            .from_(parent)
+            .subquery(bounds_alias)
+        )
+
+        # ── 2. series subquery ───────────────────────────────────────────────
+        series_alias = sg.to_identifier(gen_name("gf_series"), quoted=quoted)
+        series_sub = (
+            sg.select(
+                self.f.generate_series(
+                    sg.column("lo", table=bounds_alias, quoted=quoted),
+                    sg.column("hi", table=bounds_alias, quoted=quoted),
+                    bucket_width,
+                ).as_("bucket", quoted=quoted)
+            )
+            .from_(bounds_sub)
+            .subquery(series_alias)
+        )
+
+        # ── 3. Build spine (CROSS JOIN groups if any) ───────────────────────
+        if groups:
+            groups_alias = sg.to_identifier(gen_name("gf_groups"), quoted=quoted)
+            groups_cte = (
+                sg.select(*self._cleanup_names(groups))
+                .distinct()
+                .from_(parent)
+                .subquery(groups_alias)
+            )
+
+            spine_alias = sg.to_identifier(gen_name("gf_spine"), quoted=quoted)
+            spine_select = [
+                sg.column("bucket", table=series_alias, quoted=quoted),
+                *[sg.column(name, table=groups_alias, quoted=quoted) for name in groups]
+            ]
+            spine_sub = (
+                sg.select(*spine_select)
+                .from_(series_sub)
+                .join(groups_cte, join_type="CROSS")
+                .subquery(spine_alias)
+            )
+
+            from_target = spine_sub
+            from_alias = spine_alias
+        else:
+            from_target = series_sub
+            from_alias = series_alias
+
+        # ── 4. aggregation subquery ──────────────────────────────────────────
+        agg_alias = sg.to_identifier(gen_name("gf_agg"), quoted=quoted)
+        bucket_expr = self.f.date_bin(bucket_width, time_col, self.f.cast("epoch", self.type_mapper.from_ibis(dt.timestamp)))
+        if origin is not None:
+            bucket_expr = self.f.date_bin(bucket_width, time_col, origin)
+
+        agg_select = [
+            bucket_expr.as_("bucket", quoted=quoted),
+            *self._cleanup_names(groups),
+            *self._cleanup_names(metrics)
+        ]
+        agg_group_by = [sge.Column(this=sge.Literal.number(1))]
+        agg_group_by += [sg.column(name, quoted=quoted) for name in groups]
+
+        agg_sub = (
+            sg.select(*agg_select)
+            .from_(parent)
+            .group_by(*agg_group_by)
+            .subquery(agg_alias)
+        )
+
+        # ── 5. final LEFT JOIN ───────────────────────────────────────────────
+        join_cond = sg.column("bucket", table=from_alias, quoted=quoted).eq(
+            sg.column("bucket", table=agg_alias, quoted=quoted)
+        )
+        if groups:
+            for name in groups:
+                cond = sg.column(name, table=from_alias, quoted=quoted).eq(
+                    sg.column(name, table=agg_alias, quoted=quoted)
+                )
+                join_cond = sge.And(this=join_cond, expression=cond)
+
+        final_select = [
+            sg.column("bucket", table=from_alias, quoted=quoted),
+            *[sg.column(name, table=from_alias, quoted=quoted) for name in groups],
+            *[sg.column(name, table=agg_alias, quoted=quoted) for name in metrics],
+        ]
+
+        return (
+            sg.select(*final_select)
+            .from_(from_target)
+            .join(agg_sub, on=join_cond, join_type="LEFT")
+        )
+
 
 compiler = PostgresCompiler()
+
