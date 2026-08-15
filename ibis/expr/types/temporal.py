@@ -7,6 +7,7 @@ from public import public
 import ibis
 import ibis.expr.datashape as ds
 import ibis.expr.datatypes as dt
+import ibis.common.exceptions as com
 import ibis.expr.operations as ops
 from ibis import util
 from ibis.common.annotations import annotated
@@ -1238,7 +1239,84 @@ class TimestampScalar(Scalar, TimestampValue):
 
 @public
 class TimestampColumn(Column, TimestampValue):
-    pass
+
+    @util.experimental
+    def gapfill(
+        self,
+        bucket_width: ir.IntervalScalar,
+        *,
+        groups: ir.Value | list[ir.Value] | None = None,
+        metrics: ir.Value | list[ir.Value] | None = None,
+        origin: ir.IntervalScalar | None = None,
+    ) -> ir.Table:
+        """Generate a dense, gap-filled time-series table from this timestamp column.
+
+        For every bucket of ``bucket_width`` duration that falls between the
+        minimum and maximum values of this column, a row is guaranteed to exist
+        in the output. Buckets with no matching source rows will have ``NULL``
+        values for all metric columns.
+
+        Parameters
+        ----------
+        bucket_width
+            Fixed interval width for each generated bucket
+            (e.g. ``ibis.interval(minutes=15)`` or ``ibis.interval(hours=1)``).
+        groups
+            One or more columns to partition by. A separate dense series is
+            generated for each unique combination of group keys.
+        metrics
+            Aggregated scalar columns whose values will be ``NULL`` for
+            missing buckets.
+        origin
+            An optional interval offset from the UNIX epoch used to shift the
+            bucket grid alignment.
+
+        Returns
+        -------
+        ir.Table
+            A table with a leading ``bucket`` timestamp column, optional group
+            columns, and optional metric columns. Missing buckets appear as
+            rows with ``NULL`` metric values.
+        """
+        from ibis.common.collections import FrozenOrderedDict
+        from ibis.expr.types.relations import unwrap_aliases
+
+        # Normalise groups and metrics to lists
+        if groups is None:
+            groups = []
+        elif not isinstance(groups, list):
+            groups = [groups]
+
+        if metrics is None:
+            metrics = []
+        elif not isinstance(metrics, list):
+            metrics = [metrics]
+
+        # Resolve the parent relation from this column's operation
+        col_op = self.op()
+        parent_rel = col_op.relations
+        if len(parent_rel) != 1:
+            raise com.RelationError(
+                "gapfill() requires the timestamp column to belong to "
+                "exactly one relation"
+            )
+        (parent_rel,) = parent_rel
+
+        bound_groups = unwrap_aliases(
+            parent_rel.to_expr().bind(groups)
+        )
+        bound_metrics = unwrap_aliases(
+            parent_rel.to_expr().bind(metrics)
+        )
+
+        return ops.GapFill(
+            parent=parent_rel,
+            time_col=col_op,
+            bucket_width=bucket_width,
+            groups=FrozenOrderedDict(bound_groups),
+            metrics=FrozenOrderedDict(bound_metrics),
+            origin=origin,
+        ).to_expr()
 
 
 @public

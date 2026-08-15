@@ -1682,3 +1682,90 @@ def visit_StringFind(op, **kw):
     end = translate(op.end, **kw) if op.end is not None else None
     expr = arg.str.slice(start, end).str.find(_literal_value(op.substr), literal=True)
     return pl.when(expr.is_null()).then(-1).otherwise(expr + start)
+
+
+@translate.register(ops.GapFill)
+def gap_fill(op, **kw):
+    """Compile GapFill for Polars using group_by_dynamic + pl.datetime_range join.
+
+    Features the sorting fix, datetime_range fix, and magnitude mapping fix.
+    """
+    from ibis.expr.rewrites import rewrite_gapfill_input
+
+    rewrite_gapfill_input(op)
+
+    # ── 1. Translate the parent LazyFrame ────────────────────────────────
+    parent_lf = translate(op.parent, **kw)
+
+    # ── 2. Resolve the time column name ──────────────────────────────────
+    time_col_name = op.time_col.name
+
+    # ── 3. Resolve the interval unit + every string dynamically ──────────
+    val = op.bucket_width.value
+    unit = op.bucket_width.dtype.resolution  # 'ns', 'us', 'ms', 's', 'm', 'h', 'D', 'M', 'Y'
+    _unit_to_polars = {
+        "ns": "ns",
+        "us": "us",
+        "ms": "ms",
+        "s":  "s",
+        "m":  "m",
+        "h":  "h",
+        "D":  "d",
+        "M":  "mo",
+        "Y":  "y",
+    }
+    every = f"{val}{_unit_to_polars[unit]}"
+
+    # ── 4. Sort the parent LazyFrame (Polars sorting requirement) ─────────
+    sorted_lf = parent_lf.sort(time_col_name)
+
+    # ── 5. Build group-by keys and metrics ───────────────────────────────
+    group_keys = [name for name in op.groups]
+    agg_exprs = []
+    for name, metric_op in op.metrics.items():
+        agg_exprs.append(translate(metric_op, **kw).alias(name))
+
+    # ── 6. Aggregate using group_by_dynamic ───────────────────────────────
+    if group_keys:
+        agg_lf = sorted_lf.group_by_dynamic(
+            index_column=time_col_name,
+            every=every,
+            group_by=group_keys,
+        ).agg(*agg_exprs)
+    else:
+        agg_lf = sorted_lf.group_by_dynamic(
+            index_column=time_col_name,
+            every=every,
+        ).agg(*agg_exprs)
+
+    # Rename the time column to 'bucket' to match the GapFill output schema
+    agg_lf = agg_lf.rename({time_col_name: "bucket"})
+
+    # ── 7. Build the dense bucket spine (using datetime_range for timestamps) ─
+    bounds = parent_lf.select(
+        pl.col(time_col_name).min().alias("lo"),
+        pl.col(time_col_name).max().alias("hi"),
+    ).collect()
+
+    lo = bounds["lo"][0]
+    hi = bounds["hi"][0]
+
+    if lo is None or hi is None:
+        # Empty table — return an empty LazyFrame with the correct schema
+        return agg_lf
+
+    spine = pl.LazyFrame(
+        {"bucket": pl.datetime_range(lo, hi, every, eager=True)}
+    )
+
+    # ── 8. If there are group keys, cross-join spine with distinct groups ─
+    if group_keys:
+        distinct_groups = parent_lf.select(group_keys).unique()
+        spine = spine.join(distinct_groups, how="cross")
+
+    # ── 9. LEFT JOIN spine onto the aggregation ───────────────────────────
+    on_keys = ["bucket"] + group_keys
+    result = spine.join(agg_lf, on=on_keys, how="left")
+
+    return result
+
