@@ -1682,3 +1682,123 @@ def visit_StringFind(op, **kw):
     end = translate(op.end, **kw) if op.end is not None else None
     expr = arg.str.slice(start, end).str.find(_literal_value(op.substr), literal=True)
     return pl.when(expr.is_null()).then(-1).otherwise(expr + start)
+
+
+def _polars_gapfill_every(op):
+    val = op.bucket_width.value
+    unit = op.bucket_width.dtype.unit.value
+    _unit_to_polars = {
+        "ns": "ns",
+        "us": "us",
+        "ms": "ms",
+        "s": "s",
+        "m": "m",
+        "h": "h",
+        "D": "d",
+        "W": "w",
+        "M": "mo",
+        "Q": "q",
+        "Y": "y",
+    }
+    if unit not in _unit_to_polars:
+        raise com.UnsupportedOperationError(
+            f"Polars backend does not support interval unit {unit!r}"
+        )
+    return f"{val}{_unit_to_polars[unit]}"
+
+
+def _polars_gapfill_spine(
+    parent_lf, time_col_key, every, bucket_dtype, internal_group_keys
+):
+    import inspect
+
+    lo = pl.col(time_col_key).min().dt.truncate(every)
+    hi = pl.col(time_col_key).max().dt.truncate(every)
+    sig = inspect.signature(pl.datetime_ranges)
+    if "interval" in sig.parameters:
+        ranges_expr = pl.datetime_ranges(lo, hi, interval=every)
+    else:
+        ranges_expr = pl.datetime_ranges(lo, hi, every=every)
+    spine = (
+        parent_lf.select(ranges_expr.explode().alias("bucket"))
+        .filter(pl.col("bucket").is_not_null())
+        .select(pl.col("bucket").cast(bucket_dtype))
+    )
+    if internal_group_keys:
+        distinct_groups = parent_lf.select(internal_group_keys).unique()
+        spine = spine.join(distinct_groups, how="cross")
+    return spine
+
+
+def _polars_gapfill_agg(parent_lf, time_col_key, every, internal_group_keys, agg_exprs):
+    sorted_lf = parent_lf.filter(pl.col(time_col_key).is_not_null()).sort(time_col_key)
+    gb_method = (
+        "group_by_dynamic"
+        if hasattr(sorted_lf, "group_by_dynamic")
+        else "groupby_dynamic"
+    )
+    gb_func = getattr(sorted_lf, gb_method)
+    if internal_group_keys:
+        agg_lf = gb_func(
+            index_column=time_col_key,
+            every=every,
+            group_by=internal_group_keys,
+            start_by="window",
+        ).agg(*agg_exprs)
+    else:
+        agg_lf = gb_func(
+            index_column=time_col_key,
+            every=every,
+            start_by="window",
+        ).agg(*agg_exprs)
+    return agg_lf.rename({time_col_key: "bucket"})
+
+
+def _polars_gapfill_join(spine, agg_lf, internal_group_keys, group_key_map, op):
+    import inspect
+
+    on_keys = ["bucket"] + internal_group_keys
+    join_kwargs = {"how": "left"}
+    sig_join = inspect.signature(pl.LazyFrame.join)
+    if "nulls_equal" in sig_join.parameters:
+        join_kwargs["nulls_equal"] = True
+    elif "join_nulls" in sig_join.parameters:
+        join_kwargs["join_nulls"] = True
+    result = spine.join(agg_lf, on=on_keys, **join_kwargs)
+    rename_map = {temp_name: name for name, temp_name in group_key_map.items()}
+    if rename_map:
+        result = result.rename(rename_map)
+    final_cols = ["bucket"] + list(op.groups.keys()) + list(op.metrics.keys())
+    return result.select(final_cols)
+
+
+@translate.register(ops.GapFill)
+def gap_fill(op, **kw):
+    """Compile GapFill for Polars using group_by_dynamic + pl.datetime_range join."""
+    if op.origin is not None:
+        raise com.UnsupportedOperationError(
+            "Polars backend does not support custom origin in gapfill"
+        )
+    parent_lf = translate(op.parent, **kw)
+    time_col_key = gen_name("gf_time")
+    time_col_expr = translate(op.time_col, **kw).alias(time_col_key)
+    group_key_map = {name: gen_name(f"gf_grp_{name}") for name in op.groups}
+    group_cols_exprs = [
+        translate(op.groups[name], **kw).alias(temp_name)
+        for name, temp_name in group_key_map.items()
+    ]
+    parent_lf = parent_lf.with_columns([time_col_expr, *group_cols_exprs])
+    every = _polars_gapfill_every(op)
+    internal_group_keys = list(group_key_map.values())
+    agg_exprs = [
+        translate(metric_op, in_group_by=True, **kw).alias(name)
+        for name, metric_op in op.metrics.items()
+    ]
+    agg_lf = _polars_gapfill_agg(
+        parent_lf, time_col_key, every, internal_group_keys, agg_exprs
+    )
+    bucket_dtype = PolarsType.from_ibis(op.time_col.dtype)
+    spine = _polars_gapfill_spine(
+        parent_lf, time_col_key, every, bucket_dtype, internal_group_keys
+    )
+    return _polars_gapfill_join(spine, agg_lf, internal_group_keys, group_key_map, op)

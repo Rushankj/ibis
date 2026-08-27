@@ -406,3 +406,34 @@ def simplify(node):
     node = node.replace(subsequent_projects | subsequent_filters)
     node = node.replace(complete_reprojection)
     return node
+
+
+def rewrite_gapfill_input(node: ops.GapFill) -> ops.GapFill:
+    """Validate and normalize a GapFill operation."""
+    from ibis.common.exceptions import IbisInputError
+
+    if not isinstance(node.bucket_width, ops.Literal) or not isinstance(
+        node.bucket_width.value, (int, float)
+    ):
+        raise IbisInputError(
+            f"GapFill bucket_width must be a constant interval literal with integer or float value. Got {node.bucket_width!r}."
+        )
+
+    for name, metric in node.metrics.items():
+        if not isinstance(metric, ops.Reduction):
+            raise IbisInputError(
+                f"GapFill metric {name!r} must be a reduction expression "
+                f"(e.g. .sum(), .mean(), .count()). Got {type(metric).__name__!r}."
+            )
+    if "bucket" in node.groups or "bucket" in node.metrics:
+        raise IbisInputError(
+            "Cannot use 'bucket' as a grouping key or metric name in gapfill(); "
+            "'bucket' is reserved for the generated timestamp bucket column."
+        )
+    overlap = set(node.groups.keys()) & set(node.metrics.keys())
+    if overlap:
+        raise IbisInputError(
+            f"GapFill columns {sorted(overlap)!r} appear in both 'groups' and 'metrics'. "
+            f"A column can only be one of them."
+        )
+    return node

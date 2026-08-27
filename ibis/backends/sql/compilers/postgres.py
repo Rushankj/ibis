@@ -966,5 +966,104 @@ $$""".format(
     def visit_StringToTime(self, op, *, arg, format_str):
         return self.cast(self.f.str_to_time(arg, format_str), to=dt.time)
 
+    def visit_GapFill(
+        self, op, *, parent, time_col, bucket_width, groups, metrics, origin
+    ):
+        """Compile GapFill for PostgreSQL using generate_series + LEFT JOIN."""
+        interval_unit = op.bucket_width.dtype.unit.value
+        val = op.bucket_width.value
+        origin_expr = (
+            origin
+            if origin is not None
+            else self.f.cast("epoch", self.type_mapper.from_ibis(op.time_col.dtype))
+        )
+
+        if interval_unit in ("M", "Q", "Y"):
+            unit_map = {"M": "month", "Q": "quarter", "Y": "year"}
+            pg_unit = unit_map[interval_unit]
+            mult = {"M": 1, "Q": 3, "Y": 12}[interval_unit]
+            step_months = val * mult
+            series_step = sge.Interval(this=sge.Literal.string(f"{step_months} month"))
+            if val == 1:
+
+                def calc_bucket(node):
+                    return self.f.date_trunc(sge.Literal.string(pg_unit), node)
+
+            else:
+
+                def calc_bucket(node):
+                    y_diff = sge.Sub(
+                        this=sge.Extract(this=sge.Var(this="YEAR"), expression=node),
+                        expression=sge.Extract(
+                            this=sge.Var(this="YEAR"), expression=origin_expr
+                        ),
+                    )
+                    m_diff = sge.Sub(
+                        this=sge.Extract(this=sge.Var(this="MONTH"), expression=node),
+                        expression=sge.Extract(
+                            this=sge.Var(this="MONTH"), expression=origin_expr
+                        ),
+                    )
+                    total_months = sge.Add(
+                        this=sge.Mul(
+                            this=sge.Paren(this=y_diff),
+                            expression=sge.Literal.number(12),
+                        ),
+                        expression=sge.Paren(this=m_diff),
+                    )
+                    floored_months = sge.Mul(
+                        this=sge.Floor(
+                            this=sge.Div(
+                                this=self.cast(
+                                    sge.Paren(this=total_months), to=dt.float64
+                                ),
+                                expression=sge.Literal.number(step_months),
+                            )
+                        ),
+                        expression=sge.Literal.number(step_months),
+                    )
+                    origin_trunc = self.f.date_trunc(
+                        sge.Literal.string("month"), origin_expr
+                    )
+                    return sge.Add(
+                        this=origin_trunc,
+                        expression=sge.Mul(
+                            this=sge.Paren(this=floored_months),
+                            expression=sge.Interval(this=sge.Literal.string("1 month")),
+                        ),
+                    )
+
+        else:
+            series_step = bucket_width
+
+            def calc_bucket(node):
+                return self.f.date_bin(bucket_width, node, origin_expr)
+
+        lo_expr = calc_bucket(self.f.min(time_col))
+        hi_expr = calc_bucket(self.f.max(time_col))
+        bucket_expr = calc_bucket(time_col)
+
+        def get_series_select(bounds_alias, _series_alias):
+            return self.f.generate_series(
+                sg.column("lo", table=bounds_alias, quoted=self.quoted),
+                sg.column("hi", table=bounds_alias, quoted=self.quoted),
+                series_step,
+            ).as_("bucket", quoted=self.quoted)
+
+        def get_series_joins(_bounds_alias, _series_alias):
+            return []
+
+        return self._compile_gapfill(
+            op,
+            parent=parent,
+            groups=groups,
+            metrics=metrics,
+            lo_expr=lo_expr,
+            hi_expr=hi_expr,
+            get_series_select=get_series_select,
+            get_series_joins=get_series_joins,
+            bucket_expr=bucket_expr,
+        )
+
 
 compiler = PostgresCompiler()
