@@ -713,5 +713,44 @@ class DuckDBCompiler(SQLGlotCompiler):
     def visit_StringToTime(self, op, *, arg, format_str):
         return self.cast(self.f.str_to_time(arg, format_str), to=dt.time)
 
+    def visit_GapFill(
+        self, op, *, parent, time_col, bucket_width, groups, metrics, origin
+    ):
+        """Compile GapFill into a DuckDB CTE with generate_series + LEFT JOIN."""
+        lo_expr = self.f.time_bucket(bucket_width, self.f.min(time_col))
+        hi_expr = self.f.time_bucket(bucket_width, self.f.max(time_col))
+        if origin is not None:
+            lo_expr = self.f.time_bucket(bucket_width, self.f.min(time_col), origin)
+            hi_expr = self.f.time_bucket(bucket_width, self.f.max(time_col), origin)
+        bucket_expr = self.f.time_bucket(bucket_width, time_col)
+        if origin is not None:
+            bucket_expr = self.f.time_bucket(bucket_width, time_col, origin)
+
+        def get_series_select(bounds_alias, _series_alias):
+            return sge.Unnest(
+                expressions=[
+                    self.f.generate_series(
+                        sg.column("lo", table=bounds_alias, quoted=self.quoted),
+                        sg.column("hi", table=bounds_alias, quoted=self.quoted),
+                        bucket_width,
+                    )
+                ]
+            ).as_("bucket", quoted=self.quoted)
+
+        def get_series_joins(_bounds_alias, _series_alias):
+            return []
+
+        return self._compile_gapfill(
+            op,
+            parent=parent,
+            groups=groups,
+            metrics=metrics,
+            lo_expr=lo_expr,
+            hi_expr=hi_expr,
+            get_series_select=get_series_select,
+            get_series_joins=get_series_joins,
+            bucket_expr=bucket_expr,
+        )
+
 
 compiler = DuckDBCompiler()

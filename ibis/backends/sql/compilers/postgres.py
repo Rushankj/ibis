@@ -966,5 +966,49 @@ $$""".format(
     def visit_StringToTime(self, op, *, arg, format_str):
         return self.cast(self.f.str_to_time(arg, format_str), to=dt.time)
 
+    def visit_GapFill(
+        self, op, *, parent, time_col, bucket_width, groups, metrics, origin
+    ):
+        """Compile GapFill for PostgreSQL using generate_series + LEFT JOIN."""
+        interval_unit = op.bucket_width.dtype.unit.value
+        if interval_unit in ("M", "Q", "Y"):
+            unit_map = {"M": "month", "Q": "quarter", "Y": "year"}
+            pg_unit = unit_map[interval_unit]
+            unit_str = sge.Literal.string(pg_unit)
+            lo_expr = self.f.date_trunc(unit_str, self.f.min(time_col))
+            hi_expr = self.f.date_trunc(unit_str, self.f.max(time_col))
+            bucket_expr = self.f.date_trunc(unit_str, time_col)
+        else:
+            origin_expr = (
+                origin
+                if origin is not None
+                else self.f.cast("epoch", self.type_mapper.from_ibis(op.time_col.dtype))
+            )
+            lo_expr = self.f.date_bin(bucket_width, self.f.min(time_col), origin_expr)
+            hi_expr = self.f.date_bin(bucket_width, self.f.max(time_col), origin_expr)
+            bucket_expr = self.f.date_bin(bucket_width, time_col, origin_expr)
+
+        def get_series_select(bounds_alias, _series_alias):
+            return self.f.generate_series(
+                sg.column("lo", table=bounds_alias, quoted=self.quoted),
+                sg.column("hi", table=bounds_alias, quoted=self.quoted),
+                bucket_width,
+            ).as_("bucket", quoted=self.quoted)
+
+        def get_series_joins(_bounds_alias, _series_alias):
+            return []
+
+        return self._compile_gapfill(
+            op,
+            parent=parent,
+            groups=groups,
+            metrics=metrics,
+            lo_expr=lo_expr,
+            hi_expr=hi_expr,
+            get_series_select=get_series_select,
+            get_series_joins=get_series_joins,
+            bucket_expr=bucket_expr,
+        )
+
 
 compiler = PostgresCompiler()

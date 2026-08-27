@@ -1682,3 +1682,88 @@ def visit_StringFind(op, **kw):
     end = translate(op.end, **kw) if op.end is not None else None
     expr = arg.str.slice(start, end).str.find(_literal_value(op.substr), literal=True)
     return pl.when(expr.is_null()).then(-1).otherwise(expr + start)
+
+
+@translate.register(ops.GapFill)
+def gap_fill(op, **kw):
+    """Compile GapFill for Polars using group_by_dynamic + pl.datetime_range join."""
+    import inspect
+
+    import ibis.common.exceptions as com
+    from ibis.formats.polars import PolarsType
+
+    if op.origin is not None:
+        raise com.UnsupportedOperationError(
+            "Polars backend does not support custom origin in gapfill"
+        )
+    parent_lf = translate(op.parent, **kw)
+    time_col_name = op.time_col.name
+    val = op.bucket_width.value
+    unit = op.bucket_width.dtype.unit.value
+    _unit_to_polars = {
+        "ns": "ns",
+        "us": "us",
+        "ms": "ms",
+        "s": "s",
+        "m": "m",
+        "h": "h",
+        "D": "d",
+        "W": "w",
+        "M": "mo",
+        "Q": "q",
+        "Y": "y",
+    }
+    if unit not in _unit_to_polars:
+        raise com.UnsupportedOperationError(
+            f"Polars backend does not support interval unit {unit!r}"
+        )
+    every = f"{val}{_unit_to_polars[unit]}"
+    sorted_lf = parent_lf.sort(time_col_name)
+    group_keys = list(op.groups)
+    agg_exprs = []
+    for name, metric_op in op.metrics.items():
+        agg_exprs.append(translate(metric_op, **kw).alias(name))
+    gb_method = (
+        "group_by_dynamic"
+        if hasattr(sorted_lf, "group_by_dynamic")
+        else "groupby_dynamic"
+    )
+    gb_func = getattr(sorted_lf, gb_method)
+    if group_keys:
+        agg_lf = gb_func(
+            index_column=time_col_name,
+            every=every,
+            group_by=group_keys,
+            start_by="window",
+        ).agg(*agg_exprs)
+    else:
+        agg_lf = gb_func(
+            index_column=time_col_name,
+            every=every,
+            start_by="window",
+        ).agg(*agg_exprs)
+    agg_lf = agg_lf.rename({time_col_name: "bucket"})
+    bucket_dtype = PolarsType.from_ibis(op.time_col.dtype)
+    lo = pl.col(time_col_name).min().dt.truncate(every)
+    hi = pl.col(time_col_name).max().dt.truncate(every)
+    sig = inspect.signature(pl.datetime_ranges)
+    if "interval" in sig.parameters:
+        ranges_expr = pl.datetime_ranges(lo, hi, interval=every)
+    else:
+        ranges_expr = pl.datetime_ranges(lo, hi, every=every)
+    spine = parent_lf.select(ranges_expr.explode().alias("bucket")).filter(
+        pl.col("bucket").is_not_null()
+    )
+    spine = spine.select(pl.col("bucket").cast(bucket_dtype))
+    if group_keys:
+        distinct_groups = parent_lf.select(group_keys).unique()
+        spine = spine.join(distinct_groups, how="cross")
+    on_keys = ["bucket"] + group_keys
+    join_kwargs = {"how": "left"}
+    sig_join = inspect.signature(pl.LazyFrame.join)
+    if "nulls_equal" in sig_join.parameters:
+        join_kwargs["nulls_equal"] = True
+    elif "join_nulls" in sig_join.parameters:
+        join_kwargs["join_nulls"] = True
+    result = spine.join(agg_lf, on=on_keys, **join_kwargs)
+    return result

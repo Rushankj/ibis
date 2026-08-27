@@ -38,3 +38,27 @@ class WindowAggregate(Relation):
             **{k: v.dtype for k, v in self.metrics.items()},
         }
         return Schema(field_pairs)
+
+
+@public
+class GapFill(Relation):
+    parent: Relation
+    time_col: Unaliased[Column]
+    bucket_width: Scalar[dt.Interval]
+    groups: FrozenOrderedDict[str, Unaliased[Column]]
+    metrics: FrozenOrderedDict[str, Unaliased[Scalar]]
+    origin: Optional[Scalar[dt.Timestamp]] = None
+
+    @attribute
+    def values(self):
+        return FrozenOrderedDict({**self.groups, **self.metrics})
+
+    @attribute
+    def schema(self):
+        tz = getattr(self.time_col.dtype, "timezone", None)
+        field_pairs = {
+            "bucket": dt.Timestamp(timezone=tz, nullable=True),
+            **{k: v.dtype for k, v in self.groups.items()},
+            **{k: v.dtype for k, v in self.metrics.items()},
+        }
+        return Schema(field_pairs)

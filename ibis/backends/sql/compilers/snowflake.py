@@ -940,5 +940,93 @@ $$""",
     def visit_ArrayMean(self, op, *, arg):
         return self.cast(self.f.udf.array_avg(arg), op.dtype)
 
+    def visit_GapFill(
+        self, op, *, parent, time_col, bucket_width, groups, metrics, origin
+    ):
+        """Compile GapFill for Snowflake."""
+        import ibis.common.exceptions as com
+
+        if origin is not None:
+            raise com.UnsupportedOperationError(
+                "Snowflake backend does not support custom origin in gapfill"
+            )
+        val = op.bucket_width.value
+        interval_unit = op.bucket_width.dtype.unit.value
+        _unit_map = {
+            "ns": "nanosecond",
+            "us": "microsecond",
+            "ms": "millisecond",
+            "s": "second",
+            "m": "minute",
+            "h": "hour",
+            "D": "day",
+            "W": "week",
+            "M": "month",
+            "Q": "quarter",
+            "Y": "year",
+        }
+        if interval_unit not in _unit_map:
+            raise com.UnsupportedOperationError(
+                f"Snowflake backend does not support interval unit {interval_unit!r}"
+            )
+        sf_unit = _unit_map[interval_unit]
+        unit_lit = sge.Var(this=sf_unit)
+        lo_expr = self.f.time_slice(
+            self.f.min(time_col), sge.Literal.number(val), unit_lit
+        )
+        hi_expr = self.f.time_slice(
+            self.f.max(time_col), sge.Literal.number(val), unit_lit
+        )
+        bucket_expr = self.f.time_slice(time_col, sge.Literal.number(val), unit_lit)
+
+        def get_series_select(bounds_alias, _series_alias):
+            lo_ref = sg.column("lo", table=bounds_alias, quoted=self.quoted)
+            bucket_ts = self.f.dateadd(
+                unit_lit,
+                sge.Mul(
+                    this=sge.Column(this=sge.Var(this="VALUE")),
+                    expression=sge.Literal.number(val),
+                ),
+                lo_ref,
+            )
+            return bucket_ts.as_("bucket", quoted=self.quoted)
+
+        def get_series_joins(bounds_alias, _series_alias):
+            lo_ref = sg.column("lo", table=bounds_alias, quoted=self.quoted)
+            hi_ref = sg.column("hi", table=bounds_alias, quoted=self.quoted)
+            n_buckets = sge.Add(
+                this=sge.Div(
+                    this=self.f.datediff(unit_lit, lo_ref, hi_ref),
+                    expression=sge.Literal.number(val),
+                ),
+                expression=sge.Literal.number(1),
+            )
+            arr_range = sge.Anonymous(
+                this="ARRAY_GENERATE_RANGE",
+                expressions=[sge.Literal.number(0), n_buckets],
+            )
+            flatten_call = sge.Anonymous(
+                this="FLATTEN",
+                expressions=[
+                    sge.Kwarg(this=sge.Var(this="INPUT"), expression=arr_range)
+                ],
+            )
+            table_flatten = sge.Table(
+                this=sge.Anonymous(this="TABLE", expressions=[flatten_call])
+            )
+            return [(table_flatten, "CROSS")]
+
+        return self._compile_gapfill(
+            op,
+            parent=parent,
+            groups=groups,
+            metrics=metrics,
+            lo_expr=lo_expr,
+            hi_expr=hi_expr,
+            get_series_select=get_series_select,
+            get_series_joins=get_series_joins,
+            bucket_expr=bucket_expr,
+        )
+
 
 compiler = SnowflakeCompiler()

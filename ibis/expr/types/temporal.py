@@ -1238,7 +1238,67 @@ class TimestampScalar(Scalar, TimestampValue):
 
 @public
 class TimestampColumn(Column, TimestampValue):
-    pass
+    @util.experimental
+    def gapfill(
+        self,
+        bucket_width: ir.IntervalScalar,
+        *,
+        groups: ir.Value | list[ir.Value] | None = None,
+        metrics: ir.Value | list[ir.Value] | None = None,
+        origin: ir.TimestampScalar | None = None,
+    ) -> ir.Table:
+        """Generate a dense, gap-filled time-series table from this timestamp column."""
+        import ibis.common.exceptions as com
+        from ibis.common.collections import FrozenOrderedDict
+        from ibis.expr.types.relations import unwrap_aliases
+
+        if groups is None:
+            groups = []
+        elif not isinstance(groups, list):
+            groups = [groups]
+        if metrics is None:
+            metrics = []
+        elif not isinstance(metrics, list):
+            metrics = [metrics]
+        col_op = self.op()
+        parent_rel = col_op.relations
+        if len(parent_rel) != 1:
+            raise com.RelationError(
+                "gapfill() requires the timestamp column to belong to "
+                "exactly one relation"
+            )
+        (parent_rel,) = parent_rel
+        bound_groups = unwrap_aliases(parent_rel.to_expr().bind(groups))
+        bound_metrics = unwrap_aliases(parent_rel.to_expr().bind(metrics))
+        for name, metric_op in bound_metrics.items():
+            if not isinstance(metric_op, ops.Reduction):
+                raise com.IbisInputError(
+                    f"GapFill metric {name!r} must be a top-level aggregate reduction expression. "
+                    f"Got {type(metric_op).__name__}."
+                )
+        if "bucket" in bound_groups or "bucket" in bound_metrics:
+            raise com.IbisInputError(
+                "Cannot use 'bucket' as a grouping key or metric name in gapfill(); "
+                "'bucket' is reserved for the generated timestamp bucket column."
+            )
+        overlap = set(bound_groups.keys()) & set(bound_metrics.keys())
+        if overlap:
+            raise com.IbisInputError(
+                f"GapFill columns {sorted(overlap)!r} appear in both 'groups' and 'metrics'. "
+                f"A column can only be one of them."
+            )
+        gapfill_op = ops.GapFill(
+            parent=parent_rel,
+            time_col=col_op,
+            bucket_width=bucket_width,
+            groups=FrozenOrderedDict(bound_groups),
+            metrics=FrozenOrderedDict(bound_metrics),
+            origin=origin,
+        )
+        from ibis.expr.rewrites import rewrite_gapfill_input
+
+        rewrite_gapfill_input(gapfill_op)
+        return gapfill_op.to_expr()
 
 
 @public
