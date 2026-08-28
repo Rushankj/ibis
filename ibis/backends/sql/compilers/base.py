@@ -1631,6 +1631,115 @@ class SQLGlotCompiler(abc.ABC):
         # generate the SQL string
         return parsed.sql(dialect)
 
+    def _compile_gapfill(
+        self,
+        op,
+        *,
+        parent,
+        groups,
+        metrics,
+        lo_expr,
+        hi_expr,
+        get_series_select,
+        get_series_joins,
+        bucket_expr,
+    ):
+        from ibis.expr.rewrites import rewrite_gapfill_input
+        from ibis.util import gen_name
+
+        rewrite_gapfill_input(op)
+        quoted = self.quoted
+
+        bounds_alias = sg.to_identifier(gen_name("gf_bounds"), quoted=quoted)
+        bounds_cte = (
+            sg.select(
+                lo_expr.as_("lo", quoted=quoted),
+                hi_expr.as_("hi", quoted=quoted),
+            )
+            .from_(parent)
+            .subquery(bounds_alias)
+        )
+
+        series_alias = sg.to_identifier(gen_name("gf_series"), quoted=quoted)
+        series_select = get_series_select(bounds_alias, series_alias)
+        series_query = sg.select(series_select).from_(bounds_cte)
+        for join_table, join_type in get_series_joins(bounds_alias, series_alias):
+            series_query = series_query.join(join_table, join_type=join_type)
+        series_cte = series_query.subquery(series_alias)
+
+        if groups:
+            groups_alias = sg.to_identifier(gen_name("gf_groups"), quoted=quoted)
+            groups_cte = (
+                sg.select(*self._cleanup_names(groups))
+                .distinct()
+                .from_(parent)
+                .subquery(groups_alias)
+            )
+            spine_alias = sg.to_identifier(gen_name("gf_spine"), quoted=quoted)
+            spine_select = [
+                sg.column("bucket", table=series_alias, quoted=quoted),
+                *[
+                    sg.column(name, table=groups_alias, quoted=quoted)
+                    for name in groups
+                ],
+            ]
+            spine_cte = (
+                sg.select(*spine_select)
+                .from_(series_cte)
+                .join(groups_cte, join_type="CROSS")
+                .subquery(spine_alias)
+            )
+            from_target = spine_cte
+            from_alias = spine_alias
+        else:
+            from_target = series_cte
+            from_alias = series_alias
+
+        agg_alias = sg.to_identifier(gen_name("gf_agg"), quoted=quoted)
+        agg_select = [
+            bucket_expr.as_("bucket", quoted=quoted),
+            *self._cleanup_names(groups),
+            *self._cleanup_names(metrics),
+        ]
+        agg_group_by = [
+            sge.Column(this=sge.Literal.number(i + 1)) for i in range(1 + len(groups))
+        ]
+        agg_cte = (
+            sg.select(*agg_select)
+            .from_(parent)
+            .group_by(*agg_group_by)
+            .subquery(agg_alias)
+        )
+
+        join_cond = sg.column("bucket", table=from_alias, quoted=quoted).eq(
+            sg.column("bucket", table=agg_alias, quoted=quoted)
+        )
+        if groups:
+            for name in groups:
+                col_from = sg.column(name, table=from_alias, quoted=quoted)
+                col_agg = sg.column(name, table=agg_alias, quoted=quoted)
+                null_safe_eq = sge.Paren(
+                    this=sge.Or(
+                        this=col_from.eq(col_agg),
+                        expression=sge.And(
+                            this=col_from.is_(sge.Null()),
+                            expression=col_agg.is_(sge.Null()),
+                        ),
+                    )
+                )
+                join_cond = sge.And(this=join_cond, expression=null_safe_eq)
+
+        final_select = [
+            sg.column("bucket", table=from_alias, quoted=quoted),
+            *[sg.column(name, table=from_alias, quoted=quoted) for name in groups],
+            *[sg.column(name, table=agg_alias, quoted=quoted) for name in metrics],
+        ]
+        return (
+            sg.select(*final_select)
+            .from_(from_target)
+            .join(agg_cte, on=join_cond, join_type="LEFT")
+        )
+
     def _make_sample_backwards_compatible(self, *, sample, parent):
         # sample was changed to be owned by the table being sampled in 25.17.0
         #
